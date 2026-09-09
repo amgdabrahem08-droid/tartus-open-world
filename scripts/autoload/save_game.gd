@@ -82,6 +82,8 @@ func save_now() -> void:
 		"island_stage": GameState.island_stage,
 		"island_progress": GameState.island_progress,
 		"he3_cargo": GameState.he3_cargo,
+		"fame": GameState.fame,
+		"last_diss": GameState.last_diss,
 		"forbes_rivals": forbes_rivals,
 		"forbes_reached_1": Forbes.reached_number_one,
 	}
@@ -123,6 +125,15 @@ func load_into() -> bool:
 	GameState.island_stage = clampi(int(d.get("island_stage", 0)), 0, 3)
 	GameState.island_progress = clampf(float(d.get("island_progress", 0.0)), 0.0, 1.0)
 	GameState.he3_cargo = maxf(0.0, float(d.get("he3_cargo", 0.0)))
+	GameState.fame = clampf(float(d.get("fame", 0.0)), 0.0, 100.0)
+	var diss = d.get("last_diss", {})
+	if typeof(diss) == TYPE_DICTIONARY:
+		GameState.last_diss = {
+			"name": str(diss.get("name", "")),
+			"company": str(diss.get("company", "")),
+		}
+	else:
+		GameState.last_diss = {}
 
 	GameState.respect = clampf(float(d.get("respect", GameState.respect)), 0.0, 100.0)
 	GameState.happiness = clampf(float(d.get("happiness", GameState.happiness)), 0.0, 100.0)

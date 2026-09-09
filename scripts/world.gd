@@ -56,7 +56,7 @@ func on_water(x: float, z: float) -> bool:
 	if absf(x - RIVER_CX) < RIVER_HALF and z > -WORLD_HALF + 2.0 and z < WORLD_HALF + 14.0:
 		return true
 	# Open sea south of the shoreline.
-	if z > WORLD_HALF + 4.0:
+	if coast_distance(x, z) < 6.0:
 		return true
 	return false
 
@@ -96,7 +96,7 @@ func _bridge_profile(x: float) -> float:
 ## Height of the walkable surface at a point — 0 on flat ground, raised on the
 ## elevated river bridges and the dock jetties. Cars and the player ride this.
 func surface_height(x: float, z: float, alt := 0.0) -> float:
-	var h := 0.0
+	var h := terrain_height(x, z)
 	# While the office is occupied, lift the player onto its floor — but only
 	# for a caller already at office altitude; a ground-level caller in the
 	# same footprint (the downtown plaza) must get street height, not y=66.
@@ -177,7 +177,7 @@ const MOON_BASE_OFFSET_Z := -60.0    # the outpost sits this far from the pad
 # Soft limb past MOON_PLAYABLE_R (not a 240 m sinkhole that shows Earth through).
 const MOON_PLAYABLE_R := 340.0       # radius of the walkable/driveable surface
 const MOON_HORIZON_R := 620.0        # the heightfield mesh extends out this far
-const MOON_GRID_STEP := 12.0         # heightfield vertex spacing (one-time build)
+const MOON_GRID_STEP := 6.0         # heightfield vertex spacing (one-time build)
 const MOON_LIMB_DROP := 48.0         # soft horizon falloff (was 240 — read as a black hole)
 const MOON_PAD_FLAT_R := 28.0
 const MOON_PAD_BLEND_R := 48.0
@@ -247,7 +247,15 @@ var _moon_noise: FastNoiseLite       # gentle rolling-hill noise for the lunar t
 var _moon_craters: Array = []        # {x, z, r, depth} — baked once, shared by the
 									 # heightfield mesh and moon_height()
 
+var _earth_noise := FastNoiseLite.new()
+var architecture: Architecture
+
 func generate() -> void:
+	architecture = Architecture.new()
+	add_child(architecture)
+	_earth_noise.seed = 81723
+	_earth_noise.frequency = 0.008
+	_earth_noise.fractal_octaves = 4
 	# Real asphalt + lane markings from the modular road pack (CC0) — tiled along
 	# every street (see _add_road_strip). White albedo so the texture shows true.
 	_road_mat = Build.mat(Build.hex(0xffffff), 0.9)
@@ -257,7 +265,9 @@ func generate() -> void:
 	_sidewalk_mat = Build.mat(Build.hex(0xffffff), 0.9)
 	_sidewalk_mat.albedo_texture = load("res://assets/textures/footpath.png")
 	# Cool reflective glass by day, warm occupied windows after dark.
-	window_mat = Build.emissive(Build.hex(0x7893a4), Build.hex(0xffe3a3), 0.0)
+	window_mat = Build.emissive(Build.hex(0x34474d), Build.hex(0xffe3a3), 0.0)
+	window_mat.roughness = 0.2
+	window_mat.metallic = 0.3
 	window_mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	_facade_frame_mat = Build.cmat(Build.hex(0xb4aa94), 0.72, 0.04)
 
@@ -281,7 +291,8 @@ func generate() -> void:
 	buildings.append_array(track.solids)
 	_add_suburbs()
 	_add_outer_landscape()
-	_add_clouds(45)
+	# The procedural sky provides atmospheric perspective; omit opaque cloud-ball meshes.
+	architecture.finish()
 	_build_window_multimesh()
 	_build_facade_frame_multimesh()
 	# Live FORBES banners — text-only refresh whenever the rankings tick.
@@ -289,72 +300,73 @@ func generate() -> void:
 	_refresh_forbes_banners()
 
 func _add_ground() -> void:
-	# Endless sea out to the horizon in every direction — the landmass is an
-	# island, so no view from altitude ever finds the edge of the world.
-	# Stack: horizon sea < outer wilderness < bay water < dry islands/city.
-	# Wave amp ≤ ~0.06; keep troughs clear of land under water, and peaks
-	# clear of airport / estate grass (y = 0.05).
 	_sea_horizon = Build.water_plane(16000.0, 16000.0)
-	_sea_horizon.position = Vector3(0, -0.4, 0)
+	_sea_horizon.material_override = Build.water().duplicate()
+	_sea_horizon.material_override.set_shader_parameter("carve_canal", true)
+	_sea_horizon.position.y = SEA_WATER_Y
 	_sea_horizon.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(_sea_horizon)
-	# Deep underfill under bay + canal — always below water troughs so grass
-	# never punches through as diamond tiles when waves animate.
-	var underfill := Build.plane(LAND_HALF * 2.0 + 400.0, LAND_HALF * 2.0 + 400.0,
-		Build.mat(Build.hex(0x3a452e), 1.0))
-	underfill.position = Vector3(0, -0.75, 0)
-	underfill.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(underfill)
-	# Dry wilderness landmass north of the bay shoreline, split around the river
-	# cavity so sidewalks/water aren't sitting on continuous pavement.
-	_add_dry_landmass()
-	# City ground is split around the river so the canal is a real cavity.
-	_add_city_ground_split()
-	# Bay water under island grass (airport / estate at y = 0.05).
-	var ocean := Build.water_plane(LAND_HALF * 2.0 + 360.0, 700.0)
-	ocean.position = Vector3(0, SEA_WATER_Y, WORLD_HALF + 320.0)
-	ocean.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-	add_child(ocean)
-	var sand_m := Build.cmat(Build.hex(0xd6c79c), 1.0)
-	# South shore beach — split around the river mouth so sand never fills the canal.
-	var beach_bank := _river_corridor_half()
-	var beach_z := WORLD_HALF - 5.0
-	var beach_d := 30.0
-	for side_data in [
-		{"x0": -LAND_HALF, "x1": RIVER_CX - beach_bank},
-		{"x0": RIVER_CX + beach_bank, "x1": LAND_HALF},
-	]:
-		var bw: float = side_data.x1 - side_data.x0
-		if bw < 2.0:
-			continue
-		var beach := Build.plane(bw, beach_d, sand_m)
-		beach.position = Vector3((side_data.x0 + side_data.x1) / 2.0, 0.01, beach_z)
-		beach.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		add_child(beach)
-	# Sand rims along the landmass's north, east and west coasts so the grass
-	# never knife-edges into the sea. North rim is also split at the river.
-	for rim in [
-		{"w": 26.0, "d": LAND_HALF + WORLD_HALF + 26.0,
-			"x": LAND_HALF, "z": (WORLD_HALF - LAND_HALF) / 2.0},
-		{"w": 26.0, "d": LAND_HALF + WORLD_HALF + 26.0,
-			"x": -LAND_HALF, "z": (WORLD_HALF - LAND_HALF) / 2.0},
-	]:
-		var strip := Build.plane(rim.w, rim.d, sand_m)
-		strip.position = Vector3(rim.x, -0.03, rim.z)
-		strip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		add_child(strip)
-	# North coast sand — two halves, not across the canal.
-	for side_data2 in [
-		{"x0": -LAND_HALF - 26.0, "x1": RIVER_CX - beach_bank},
-		{"x0": RIVER_CX + beach_bank, "x1": LAND_HALF + 26.0},
-	]:
-		var nw: float = side_data2.x1 - side_data2.x0
-		if nw < 2.0:
-			continue
-		var nstrip := Build.plane(nw, 26.0, sand_m)
-		nstrip.position = Vector3((side_data2.x0 + side_data2.x1) / 2.0, -0.03, -LAND_HALF)
-		nstrip.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
-		add_child(nstrip)
+	_add_natural_terrain()
+
+
+## Signed inland distance, shared by the visible shore and gameplay queries.
+func coast_distance(x: float, z: float) -> float:
+	var outer := smoothstep(220.0, 440.0, absf(x))
+	var south := WORLD_HALF + 10.0 + outer * (24.0 * sin(x * 0.013) + 13.0 * sin(x * 0.031))
+	var side := LAND_HALF - 55.0 + 32.0 * sin(z * 0.009) + 19.0 * sin(z * 0.023)
+	var north := -LAND_HALF + 40.0 + 28.0 * sin(x * 0.011) + 16.0 * cos(x * 0.025)
+	var mainland := minf(south - z, minf(side - absf(x), z - north))
+	# Rounded sandy aprons soften the authored runway and estate platforms.
+	for rect in [AIRFIELD, ESTATE_GROUNDS]:
+		var q := Vector2(maxf(rect.x0 - x, maxf(0.0, x - rect.x1)),
+			maxf(rect.z0 - z, maxf(0.0, z - rect.z1)))
+		var apron := lerpf(7.0, 38.0 + sin(z * 0.036 + x * 0.021) * 12.0, smoothstep(rect.z0, rect.z0+65.0, z))
+		mainland = maxf(mainland, apron - q.length())
+	return mainland
+
+
+func terrain_height(x: float, z: float) -> float:
+	var inland := coast_distance(x, z)
+	var shore := lerpf(-1.8, 0.0, smoothstep(-14.0, 14.0, inland))
+	var wild := smoothstep(455.0, 620.0, maxf(absf(x), -z))
+	var hills := (9.0 + 12.0 * _earth_noise.get_noise_2d(x, z)) * wild
+	var facility_flat := smoothstep(120.0, 190.0, Vector2(x - LAUNCH.x, z - LAUNCH.z).length())
+	var h := shore + hills * facility_flat * smoothstep(12.0, 80.0, inland)
+	if absf(x - RIVER_CX) < _river_corridor_half() and absf(z) < WORLD_HALF + 12.0:
+		h = RIVER_BED_Y
+	return h
+
+
+func _add_natural_terrain() -> void:
+	var st := SurfaceTool.new()
+	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	var step := 8.0
+	for ix in range(-106, 106):
+		for iz in range(-106, 104):
+			var x := ix * step
+			var z := iz * step
+			var points: Array[Vector3] = []
+			for offset in [Vector2.ZERO, Vector2(step, 0), Vector2(0, step), Vector2(step, step)]:
+				var px: float = x + offset.x
+				var pz: float = z + offset.y
+				points.append(Vector3(px, terrain_height(px, pz), pz))
+			for j in [0, 1, 3, 0, 3, 2]:
+				var v := points[j]
+				var green := smoothstep(9.0, 32.0, coast_distance(v.x, v.z))
+				var shade := 0.95 + 0.09 * _earth_noise.get_noise_2d(v.x*2.5, v.z*2.5)
+				st.set_color(Build.hex(0xc8b98e).lerp(Build.hex(0x637349), green) * Color(shade, shade, shade, 1))
+				var eps := 0.5
+				st.set_normal(Vector3(terrain_height(v.x-eps, v.z)-terrain_height(v.x+eps, v.z),
+					2.0*eps, terrain_height(v.x, v.z-eps)-terrain_height(v.x, v.z+eps)).normalized())
+				st.add_vertex(v)
+	var mi := MeshInstance3D.new()
+	mi.name = "NaturalCoastTerrain"
+	mi.mesh = st.commit()
+	var mat := Build.mat(Color.WHITE, 0.96)
+	mat.vertex_color_use_as_albedo = true
+	mat.vertex_color_is_srgb = true
+	mi.material_override = mat
+	add_child(mi)
 
 
 ## Half-width of the OPEN canal corridor at street level — everything from
@@ -1178,7 +1190,7 @@ func _moon_flatten_weight(d: float, flat_r: float, blend_r: float) -> float:
 ## A thick underside slab hides the city 4 km below so the plate never reads
 ## as a transparent sheet with Earth showing through holes.
 func _build_moon_surface() -> void:
-	var grey := Build.mat(Build.hex(0xb0b0b6), 0.92)
+	var grey := Build.facade(Build.hex(0x999994), "stucco")
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
 	var half := MOON_HORIZON_R
@@ -1189,14 +1201,15 @@ func _build_moon_surface() -> void:
 		for gz in steps:
 			var z0 := MOON_PAD.z - half + gz * MOON_GRID_STEP
 			var z1 := z0 + MOON_GRID_STEP
+			if Vector2(x0+MOON_GRID_STEP/2.0-MOON_PAD.x, z0+MOON_GRID_STEP/2.0-MOON_PAD.z).length() > MOON_HORIZON_R:
+				continue
 			var p00 := Vector3(x0, moon_height(x0, z0) - MOON_Y, z0)
 			var p10 := Vector3(x1, moon_height(x1, z0) - MOON_Y, z0)
 			var p01 := Vector3(x0, moon_height(x0, z1) - MOON_Y, z1)
 			var p11 := Vector3(x1, moon_height(x1, z1) - MOON_Y, z1)
-			# Counter-clockwise from above: the previous winding pointed normals
-			# down into the Moon, exposing the mesh underside as giant sheets.
-			_moon_tri(st, p00, p11, p10)
-			_moon_tri(st, p00, p01, p11)
+			# Clockwise winding is front-facing in Godot; keep the lunar top visible.
+			_moon_tri(st, p00, p10, p11)
+			_moon_tri(st, p00, p11, p01)
 	st.generate_normals()
 	var mesh := st.commit()
 	var mi := MeshInstance3D.new()
@@ -1206,8 +1219,8 @@ func _build_moon_surface() -> void:
 	add_child(mi)
 	# Opaque bulk under the whole disc — blocks the city through any gap.
 	var under_m := Build.mat(Build.hex(0x2a2c32), 1.0)
-	var under := Build.cyl(MOON_HORIZON_R + 30.0, MOON_HORIZON_R + 30.0, 80.0, 40, under_m)
-	under.position = Vector3(MOON_PAD.x, MOON_Y - 48.0, MOON_PAD.z)
+	var under := Build.cyl(MOON_HORIZON_R - 5.0, MOON_HORIZON_R - 5.0, 100.0, 96, under_m)
+	under.position = Vector3(MOON_PAD.x, MOON_Y - 105.0, MOON_PAD.z)
 	under.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	add_child(under)
 	# Keep the lunar ground physically solid for the buggy, spacecraft and any
@@ -1313,7 +1326,38 @@ func _build_moon_base(bx: float, bz: float, by: float) -> void:
 	add_child(sign)
 
 
+var road_segments: Array[Rect2] = []
+
 func _add_road_strip(x: float, z: float, w: float, d: float) -> void:
+	var horizontal := w > d
+	var spans: Array[Vector2] = [Vector2(x-w/2.0, x+w/2.0) if horizontal else Vector2(z-d/2.0, z+d/2.0)]
+	for property in PropertyCatalog.LIST:
+		var ex: float = property.x + (-BLOCK if property.x > 0.0 else BLOCK)/2.0
+		var ez: float = property.z + (-BLOCK if property.z > 0.0 else BLOCK)/2.0
+		if absf((z-ez) if horizontal else (x-ex)) >= 27.0 + ROAD_W/2.0:
+			continue
+		var center := ex if horizontal else ez
+		var remaining: Array[Vector2] = []
+		for span in spans:
+			if span.y <= center-27.0 or span.x >= center+27.0:
+				remaining.append(span)
+			else:
+				if span.x < center-27.0:
+					remaining.append(Vector2(span.x, center-27.0))
+				if span.y > center+27.0:
+					remaining.append(Vector2(center+27.0, span.y))
+		spans = remaining
+	for span in spans:
+		if span.y-span.x < 0.5:
+			continue
+		var sx := (span.x+span.y)/2.0 if horizontal else x
+		var sz := z if horizontal else (span.x+span.y)/2.0
+		var sw := span.y-span.x if horizontal else w
+		var sd := d if horizontal else span.y-span.x
+		road_segments.append(Rect2(sx-sw/2.0, sz-sd/2.0, sw, sd))
+		_add_road_geometry(sx, sz, sw, sd)
+
+func _add_road_geometry(x: float, z: float, w: float, d: float) -> void:
 	var horizontal := w > d
 	var road_w: float = d if horizontal else w
 	var road_len: float = w if horizontal else d
@@ -1332,7 +1376,7 @@ func _add_road_strip(x: float, z: float, w: float, d: float) -> void:
 		return
 
 	# Footpath — wider paved walkway. Always clipped so no tile enters the corridor.
-	var path_w := road_w + 14.0
+	var path_w := road_w + 3.0
 	var path_len := road_len + 14.0
 	var path_x := x
 	var path_z := z
@@ -1423,127 +1467,10 @@ func _add_road_strip(x: float, z: float, w: float, d: float) -> void:
 	add_child(r)
 
 func _add_building(x: float, z: float, w: float, d: float, h: float, color: int) -> void:
-	# A layered facade reads as an authored building instead of a single plain
-	# box. Collision still follows only the occupied main volume below.
-	var facade_style := "brick" if h < 32.0 and randf() < 0.34 else "stucco"
-	var facade := Build.facade(Build.hex(color), facade_style)
-	var base_h := minf(2.4, h * 0.18)
-	var base := Build.box(w + 0.35, base_h, d + 0.35,
-		Build.cmat(Build.hex(color).darkened(0.18), 0.88, 0.02))
-	base.position = Vector3(x, base_h / 2.0, z)
-	add_child(base)
-	var m := Build.box(w, h - base_h, d, facade)
-	m.position = Vector3(x, base_h + (h - base_h) / 2.0, z)
-	add_child(m)
-	# Contrasting corner piers make the facade read as constructed bays, not a
-	# textureless extrusion. Keep them tight to the occupied footprint.
-	var pier_m := Build.cmat(Build.hex(color).darkened(0.22), 0.76, 0.05)
-	for px in [-1.0, 1.0]:
-		for pz in [-1.0, 1.0]:
-			var pier := Build.box(0.32, h - base_h, 0.32, pier_m)
-			pier.position = Vector3(x + px * (w / 2.0 - 0.16),
-				base_h + (h - base_h) / 2.0, z + pz * (d / 2.0 - 0.16))
-			add_child(pier)
-	# Dark floor bands break up tall blank walls and give the skyline scale.
-	var band_mat := Build.cmat(Build.hex(color).darkened(0.3), 0.72, 0.08)
-	for by in range(6, int(h), 9):
-		var band := Build.box(w + 0.18, 0.22, d + 0.18, band_mat)
-		band.position = Vector3(x, float(by), z)
-		add_child(band)
-	# A proper roof line and compact rooftop plant improve silhouettes without
-	# changing the walkable footprint.
-	var roof := Build.box(w + 0.5, 0.45, d + 0.5,
-		Build.cmat(Build.hex(0x353a40), 0.82, 0.18))
-	roof.position = Vector3(x, h + 0.22, z)
-	add_child(roof)
-	if h > 13.0:
-		var plant_w := minf(4.0, w * 0.42)
-		var plant_d := minf(3.5, d * 0.4)
-		var plant := Build.box(plant_w, 1.1, plant_d,
-			Build.cmat(Build.hex(0x555b61), 0.9, 0.15))
-		plant.position = Vector3(x + w * 0.16, h + 1.0, z - d * 0.12)
-		add_child(plant)
-		# Rooftop water tank or solar canopy varies the silhouette from block to
-		# block and gives tall aerial views believable service equipment.
-		if randf() < 0.45:
-			var tank := Build.cyl(1.0, 1.0, 1.7, 12,
-				Build.cmat(Build.hex(0x6e7479), 0.45, 0.55))
-			tank.position = Vector3(x - w * 0.22, h + 1.3, z + d * 0.18)
-			add_child(tank)
-		else:
-			var solar := Build.box(minf(4.6, w * 0.55), 0.12, minf(2.5, d * 0.4),
-				Build.cmat(Build.hex(0x183653), 0.18, 0.35))
-			solar.position = Vector3(x - w * 0.12, h + 1.05, z + d * 0.16)
-			solar.rotation.x = -0.28
-			add_child(solar)
-	# Street-facing entrance and canopy. These sit against the collision volume,
-	# so the visible threshold and the point where movement stops agree.
-	var door_w := minf(2.4, w * 0.28)
-	var door := Build.box(door_w, 2.5, 0.16,
-		Build.cmat(Build.hex(0x263746), 0.24, 0.45))
-	door.position = Vector3(x, 1.25, z + d / 2.0 + 0.1)
-	add_child(door)
-	var canopy := Build.box(door_w + 1.1, 0.18, 1.15,
-		Build.cmat(Build.hex(0x30353b), 0.62, 0.25))
-	canopy.position = Vector3(x, 2.75, z + d / 2.0 + 0.55)
-	add_child(canopy)
-	# Larger buildings get a real curtain-wall rhythm: floor slabs and mullions
-	# are shared-instanced later, giving the skyline the framed glass look of a
-	# modern tower instead of isolated stickers on a box.
-	if h >= 18.0 and w >= 5.0 and d >= 5.0:
-		var floor_count := maxi(1, int((h - 2.2) / 3.2))
-		for fi in floor_count:
-			var fy := 2.2 + fi * 3.2
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(w + 0.18, 0.12, 0.14)),
-				Vector3(x, fy, z + d / 2.0 + 0.08)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(w + 0.18, 0.12, 0.14)),
-				Vector3(x, fy, z - d / 2.0 - 0.08)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.14, 0.12, d + 0.18)),
-				Vector3(x + w / 2.0 + 0.08, fy, z)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.14, 0.12, d + 0.18)),
-				Vector3(x - w / 2.0 - 0.08, fy, z)))
-		var bay_w := 3.4 if w > 9.0 else 2.7
-		var bay_d := 3.4 if d > 9.0 else 2.7
-		for mx in range(1, maxi(1, int(w / bay_w))):
-			var fx := x - w / 2.0 + mx * w / float(maxi(1, int(w / bay_w)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.12, h - 2.0, 0.14)),
-				Vector3(fx, h / 2.0 + 1.0, z + d / 2.0 + 0.08)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.12, h - 2.0, 0.14)),
-				Vector3(fx, h / 2.0 + 1.0, z - d / 2.0 - 0.08)))
-		for mz in range(1, maxi(1, int(d / bay_d))):
-			var fz := z - d / 2.0 + mz * d / float(maxi(1, int(d / bay_d)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.14, h - 2.0, 0.12)),
-				Vector3(x + w / 2.0 + 0.08, h / 2.0 + 1.0, fz)))
-			_facade_frame_xforms.append(Transform3D(Basis().scaled(Vector3(0.14, h - 2.0, 0.12)),
-				Vector3(x - w / 2.0 - 0.08, h / 2.0 + 1.0, fz)))
-	# A glazed podium grounds tall volumes and makes their street frontage read as
-	# a lobby/retail base rather than a tower hovering over a sidewalk.
-	if h >= 28.0:
-		var podium_glass := Build.box(w + 0.08, 3.0, d + 0.08,
-			Build.cmat(Build.hex(0x4d6975), 0.22, 0.35))
-		podium_glass.position = Vector3(x, 1.5, z)
-		add_child(podium_glass)
-	# Window quads collected for one shared MultiMesh.
-	var rows := int(h / 3.0)
-	var cols_w := int(w / 2.0)
-	var cols_d := int(d / 2.0)
-	for r in rows:
-		var y := 1.2 + r * 3.0
-		if cols_w > 0:
-			for c in cols_w:
-				var wx := x - w / 2.0 + 0.6 + c * (w / float(cols_w))
-				if randf() < 0.82:
-					_window_xforms.append(Transform3D(Basis(), Vector3(wx, y, z + d / 2.0 + 0.03)))
-				if randf() < 0.82:
-					_window_xforms.append(Transform3D(Basis(Vector3.UP, PI), Vector3(wx, y, z - d / 2.0 - 0.03)))
-		if cols_d > 0:
-			for c in cols_d:
-				var wz := z - d / 2.0 + 0.6 + c * (d / float(cols_d))
-				if randf() < 0.82:
-					_window_xforms.append(Transform3D(Basis(Vector3.UP, -PI / 2.0), Vector3(x + w / 2.0 + 0.03, y, wz)))
-				if randf() < 0.82:
-					_window_xforms.append(Transform3D(Basis(Vector3.UP, PI / 2.0), Vector3(x - w / 2.0 - 0.03, y, wz)))
-	buildings.append({"x": x, "z": z, "w": w + 0.35, "d": d + 0.35, "h": h})
+	var style := 0 if h >= 30.0 else (1 if int(absf(x+z)) % 3 == 0 else 2)
+	architecture.building(x, z, w, d, h, style, Build.hex(color))
+	buildings.append({"x": x, "z": z, "w": w+0.35, "d": d+0.35, "h": h+2.2})
+
 
 func _build_city() -> void:
 	# North-south roads — skip any strip that would land in the canal corridor.
@@ -1669,33 +1596,19 @@ func _district_of(cx: float, cz: float, bx: int, bz: int) -> String:
 	var d := sqrt(cx * cx + cz * cz)
 	if d < 60.0:
 		return "downtown"
-	if d < 122.0:
+	if d < 166.0:
 		return "commercial"
 	return "residential"
 
 
 ## Tall glassy towers downtown, mid-rise blocks in the commercial ring.
 func _build_towers(cx: float, cz: float, downtown: bool) -> void:
-	var usable := BLOCK - (ROAD_W + 1.0)
-	var n := (1 + randi() % 3) if downtown else (2 + randi() % 2)
-	for k in n:
-		var w: float
-		var d: float
-		var h: float
-		var col: int
-		if downtown:
-			w = 6.0 + randf() * 8.0
-			d = 6.0 + randf() * 8.0
-			h = 45.0 + randf() * 65.0
-			col = DOWNTOWN_PALETTE.pick_random()
-		else:
-			w = 4.0 + randf() * 8.0
-			d = 4.0 + randf() * 8.0
-			h = 10.0 + randf() * 30.0
-			col = PALETTE.pick_random()
-		var px := cx + (randf() - 0.5) * (usable - w)
-		var pz := cz + (randf() - 0.5) * (usable - d)
-		_add_building(px, pz, w, d, h, col)
+	# One coherent building per block: viable floorplates and plausible height/width.
+	var w := 13.0 + randf()*1.5
+	var d := 12.5 + randf()*2.0
+	var h := (30.0 + randf()*18.0) if downtown else (13.9 + (randi()%5)*3.3)
+	var palette := [0xb9b6ad, 0xa6a7a2, 0xc4bfb3, 0x929b9b]
+	_add_building(cx, cz, w, d, h, palette.pick_random())
 
 
 ## The stock exchange — a glassy tower, a paved plaza, and a trading kiosk the
@@ -1706,7 +1619,7 @@ func _build_exchange(cx: float, cz: float) -> void:
 	var plaza := Build.box(plaza_sz, 0.14, plaza_sz, Build.mat(Build.hex(0x6d6e75), 0.9))
 	plaza.position = Vector3(cx, 0.07, cz)
 	add_child(plaza)
-	var trim := Build.emissive(Build.hex(0x143028), Build.hex(0x3fd6a0), 1.0)
+	var trim := Build.cmat(Color("777b77"), 0.65, 0.2)
 	for edge in [-1.0, 1.0]:
 		var strip := Build.box(plaza_sz, 0.16, 0.5, trim)
 		strip.position = Vector3(cx, 0.15, cz + edge * plaza_sz / 2.0)
@@ -1717,16 +1630,10 @@ func _build_exchange(cx: float, cz: float) -> void:
 	var td := 9.0
 	var th := 66.0
 	var tz := cz + 3.0
-	var tower := Build.box(tw, th, td, Build.facade(Build.hex(0x2c3a4c), "brick"))
-	tower.position = Vector3(cx, th / 2.0 + 0.14, tz)
-	add_child(tower)
+	architecture.building(cx, tz, tw, td, th, 0, Color("999e9d"))
 	buildings.append({"x": cx, "z": tz, "w": tw, "d": td, "h": th})
-	var band := Build.emissive(Build.hex(0x14242f), Build.hex(0x3fd6a0), 1.6)
-	for by in [13.0, 28.0, 43.0, 58.0]:
-		var stripe := Build.box(tw + 0.3, 1.0, td + 0.3, band)
-		stripe.position = Vector3(cx, by, tz)
-		add_child(stripe)
-	var sign_panel := Build.emissive(Build.hex(0x0d1b16), Build.hex(0x4fe6b0), 2.4)
+
+	var sign_panel := Build.cmat(Color("26312f"), 0.4)
 	var sign := Build.box(12.0, 3.6, 0.4, sign_panel)
 	sign.position = Vector3(cx, th - 7.0, tz - td / 2.0 - 0.25)
 	add_child(sign)
@@ -1734,7 +1641,7 @@ func _build_exchange(cx: float, cz: float) -> void:
 	sign_text.text = "FREE HARBOR\nEXCHANGE"
 	sign_text.font_size = 84
 	sign_text.pixel_size = 0.012
-	sign_text.modulate = Color("06140f")
+	sign_text.modulate = Color("e1dfcf")
 	sign_text.outline_size = 0
 	sign_text.rotation.y = PI                                # face the plaza
 	sign_text.position = Vector3(cx, th - 7.0, tz - td / 2.0 - 0.46)
@@ -2446,194 +2353,31 @@ func _build_hospital(cx: float, cz: float) -> void:
 ## reference's Boardroom tower — cylinder + gold crown + purple cap + beam).
 ## The player presses E at the lobby doors to open the venture terminal.
 func _build_ventures(cx: float, cz: float) -> void:
-	var gold := Color("f5c451")
-	var violet := Color("9a7cff")
-	var plaza_sz := BLOCK - ROAD_W
-	var plaza := Build.box(plaza_sz, 0.14, plaza_sz, Build.mat(Build.hex(0x2a2632), 0.88))
-	plaza.position = Vector3(cx, 0.07, cz)
-	add_child(plaza)
-	var trim := Build.emissive(Build.hex(0x2e2410), gold, 1.1)
-	for edge in [-1.0, 1.0]:
-		var strip := Build.box(plaza_sz, 0.16, 0.5, trim)
-		strip.position = Vector3(cx, 0.15, cz + edge * plaza_sz / 2.0)
-		add_child(strip)
-
-	# --- Ground-floor podium: a solid two-storey base the tower sits ON TOP
-	# of (the old layout let the hex tower's bottom wedge stab through the
-	# canopy and split the sign in half), fronted by a glass curtain wall,
-	# recessed gold entry portal, canopy and one clean fascia sign. ---
-	var pw := 16.0
-	var pd := 10.0
-	var ph := 8.0
-	var pz := cz + 2.5
-	var fz := pz - pd / 2.0                                  # front face, toward the plaza
-
-	var dark := Build.mat(Build.hex(0x1b1826), 0.4, 0.55)
-	var glass := Build.mat(Build.hex(0x241f30), 0.08, 0.3)
-	glass.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	glass.albedo_color.a = 0.4
-	var frame_gold := Build.mat(Build.hex(0xb59355), 0.35, 0.8)
-
-	var body := Build.box(pw, ph, pd, dark)
-	body.position = Vector3(cx, ph / 2.0, pz)
-	add_child(body)
-	buildings.append({"x": cx, "z": pz, "w": pw, "d": pd, "h": ph})
-	# Gold parapet trim where the podium meets the tower.
-	var parapet := Build.box(pw + 0.35, 0.3, pd + 0.35, trim)
-	parapet.position = Vector3(cx, ph + 0.02, pz)
-	add_child(parapet)
-
-	# Entry steps — two shallow strips the width of the portal.
-	for si in 2:
-		var step := Build.box(9.0 - si * 1.2, 0.2, 1.4 - si * 0.5, Build.mat(Build.hex(0x18141f), 0.8))
-		step.position = Vector3(cx, 0.1 + si * 0.2, fz - 1.0 + si * 0.35)
-		add_child(step)
-
-	# Glass curtain wall proud of the facade, gold mullions between panes
-	# (the centre bay is left open for the entry portal).
-	var curtain := Build.box(pw - 3.0, 6.2, 0.18, glass)
-	curtain.position = Vector3(cx, 3.4, fz - 0.1)
-	add_child(curtain)
-	for mx in [-6.4, -4.4, -2.4, 2.4, 4.4, 6.4]:
-		var mullion := Build.box(0.16, 6.2, 0.26, frame_gold)
-		mullion.position = Vector3(cx + mx, 3.4, fz - 0.12)
-		add_child(mullion)
-
-	# Recessed gold entry portal — jambs + lintel around the doorway.
-	for jx in [-2.3, 2.3]:
-		var jamb := Build.box(0.55, 5.2, 0.6, frame_gold)
-		jamb.position = Vector3(cx + jx, 2.6, fz - 0.28)
-		add_child(jamb)
-	var lintel := Build.box(5.15, 0.55, 0.6, frame_gold)
-	lintel.position = Vector3(cx, 5.35, fz - 0.28)
-	add_child(lintel)
-	# Double doors — dark glass with a gold centre stile and push bars,
-	# not glowing slabs.
-	var door_glass := Build.mat(Build.hex(0x101c26), 0.05, 0.55)
-	door_glass.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	door_glass.albedo_color.a = 0.72
-	for dside in [-1.0, 1.0]:
-		var door := Build.box(1.96, 4.9, 0.12, door_glass)
-		door.position = Vector3(cx + dside * 1.02, 2.47, fz - 0.2)
-		add_child(door)
-		var bar := Build.box(1.4, 0.11, 0.11, frame_gold)
-		bar.position = Vector3(cx + dside * 1.02, 2.15, fz - 0.32)
-		add_child(bar)
-	var stile := Build.box(0.1, 4.9, 0.16, frame_gold)
-	stile.position = Vector3(cx, 2.47, fz - 0.22)
-	add_child(stile)
-	# Warm transom glow over the doors — the "lights on inside" read.
-	var transom := Build.box(4.5, 0.5, 0.14, Build.emissive(Build.hex(0x3a2c0a), Color("ffdf9e"), 1.3))
-	transom.position = Vector3(cx, 5.0, fz - 0.24)
-	add_child(transom)
-
-	# Entrance canopy — dark slab with a lit gold nose trim (no tie-rods:
-	# they crossed the fascia sign from the street view).
-	var canopy := Build.box(9.0, 0.32, 3.2, Build.mat(Build.hex(0x201c2a), 0.85))
-	canopy.position = Vector3(cx, 5.75, fz - 1.7)
-	add_child(canopy)
-	var nose := Build.box(9.0, 0.16, 0.16, trim)
-	nose.position = Vector3(cx, 5.83, fz - 3.28)
-	add_child(nose)
-
-	# Wall sconces between the mullions.
-	for sx in [-5.4, -3.4, 3.4, 5.4]:
-		var sconce := Build.box(0.24, 0.55, 0.14, Build.emissive(Build.hex(0x3a2c0a), Color("ffdf9e"), 2.0))
-		sconce.position = Vector3(cx + sx, 3.9, fz - 0.24)
-		add_child(sconce)
-
-	# Planters with clipped hedges flanking the steps.
-	for px2 in [-4.9, 4.9]:
-		var planter := Build.box(1.7, 0.85, 1.7, Build.mat(Build.hex(0x18141f), 0.8))
-		planter.position = Vector3(cx + px2, 0.43, fz - 1.5)
-		add_child(planter)
-		var lip := Build.box(1.8, 0.12, 1.8, frame_gold)
-		lip.position = Vector3(cx + px2, 0.88, fz - 1.5)
-		add_child(lip)
-		var hedge := Build.sphere(0.72, Build.mat(Build.hex(0x3f6b35), 0.95))
-		hedge.position = Vector3(cx + px2, 1.45, fz - 1.5)
-		add_child(hedge)
-
-	# ONE fascia sign, flat on the solid podium face above the canopy —
-	# nothing behind it, so nothing can ever clip through it again.
-	var fascia := Build.emissive(Build.hex(0x1e1a08), gold, 2.4)
-	var fband := Build.box(12.0, 1.8, 0.3, fascia)
-	fband.position = Vector3(cx, 7.0, fz - 0.3)
-	add_child(fband)
-	var fband_frame := Build.box(12.3, 2.1, 0.18, frame_gold)
-	fband_frame.position = Vector3(cx, 7.0, fz - 0.2)
-	add_child(fband_frame)
-	var sign_text := Label3D.new()
-	sign_text.text = "ANGEL VENTURES HQ"
-	sign_text.font_size = 90
-	sign_text.pixel_size = 0.0105
-	sign_text.modulate = Color("1e1a08")
-	sign_text.outline_size = 0
-	sign_text.rotation.y = PI                                # face the plaza
-	sign_text.position = Vector3(cx, 7.0, fz - 0.48)
-	add_child(sign_text)
-
-	# --- Hexagonal glass tower, seated ON the podium and rotated 30° so a
-	# FLAT face (not a vertex wedge) fronts the plaza. Its footprint stays
-	# inside the podium's, so it can never lance through the entrance again.
-	var t_bot := 5.6
-	var t_top := 4.6
-	var th := 60.0
-	var tz := pz
-	var ty := ph
-	var tower := Build.cyl(t_top, t_bot, th, 6, Build.mat(Build.hex(0x211d2c), 0.2, 0.5))
-	tower.position = Vector3(cx, ty + th / 2.0, tz)
-	tower.rotation.y = PI / 6.0
-	add_child(tower)
-	buildings.append({"x": cx, "z": tz, "w": t_bot * 2.0, "d": t_bot * 2.0, "h": th + ty})
-	var band := Build.emissive(Build.hex(0x2e2410), gold, 1.6)
-	for by in [12.0, 26.0, 40.0, 54.0]:
-		var ring := Build.cyl(t_top + 0.15, t_bot + 0.15, 0.7, 6, band)
-		ring.position = Vector3(cx, ty + by, tz)
-		ring.rotation.y = PI / 6.0
-		add_child(ring)
-
-	# A FORBES billboard on the tower's east face, near the HQ entrance
-	# (8:10.5 keeps the shared 640:840 board texture unstretched). The east
-	# face sits at ~cx + 4.5 (flat-face hex, tapering with height), so this
-	# offset keeps the mount struts buried in the wall.
-	_mount_forbes_banner(Vector3(cx + 4.7, ty + 24.0, tz), PI / 2.0, 8.0, 10.5)
-
-	# Gold crown band, then a violet spire cap — the mafia-sim tower's silhouette.
-	var crown_top := ty + th
-	var crown := Build.cyl(t_top + 0.3, t_top + 0.3, 2.4,
-		6, Build.emissive(Build.hex(0x3a2c0a), gold, 2.4))
-	crown.position = Vector3(cx, crown_top + 1.2, tz)
-	crown.rotation.y = PI / 6.0
-	add_child(crown)
-	var cap_base := crown_top + 2.4
-	var cap := Build.cyl(0.0, t_top - 0.6, 7.0, 6, Build.emissive(Build.hex(0x241a3a), violet, 2.0))
-	cap.position = Vector3(cx, cap_base + 3.5, tz)
-	cap.rotation.y = PI / 6.0
-	add_child(cap)
-
-	# A tall gold beacon of light on top, findable from across the city.
-	var beam_base := cap_base + 7.0
-	var beam_m := Build.emissive(Build.hex(0xf5c451), gold, 1.1)
-	beam_m.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
-	beam_m.albedo_color.a = 0.22
-	var beam := Build.cyl(0.6, 0.9, 22.0, 12, beam_m)
-	beam.position = Vector3(cx, beam_base + 11.0, tz)
-	add_child(beam)
-	var beacon_top := Build.sphere(1.1, Build.emissive(Build.hex(0xfff2cf), Color("fff2cf"), 4.0))
-	beacon_top.position = Vector3(cx, beam_base + 22.0, tz)
-	add_child(beacon_top)
-
-	# Entrance prompt, floating at the lobby doorway.
+	var tz := cz+2.5
+	architecture.building(cx, tz, 15.0, 10.0, 43.6, 0, Color("a6a7a0"))
+	buildings.append({"x": cx, "z": tz, "w": 15.0, "d": 10.0, "h": 45.8})
+	var stone := Build.pbr("Concrete034", Color("83877f"), 0.65)
+	architecture.box(Vector3(16, 0.16, 15), Vector3(cx, 0.08, cz), stone)
+	var panel := Build.box(10, 1.0, 0.18, Build.cmat(Color("232a2c"), 0.4, 0.35))
+	panel.position = Vector3(cx, 3.8, tz-5.15)
+	add_child(panel)
+	var label := Label3D.new()
+	label.text = "ANGEL VENTURES"
+	label.font_size = 64
+	label.pixel_size = 0.006
+	label.modulate = Color("d8d6c7")
+	label.outline_size = 0
+	label.rotation.y = PI
+	label.position = Vector3(cx, 3.8, tz-5.26)
+	add_child(label)
+	_mount_forbes_banner(Vector3(cx+7.65, 9.0, tz), PI/2.0, 4.0, 5.2)
 	var prompt := Label3D.new()
-	prompt.text = "ANGEL VENTURES  ·  PRESS E"
-	prompt.font_size = 56
-	prompt.pixel_size = 0.006
-	prompt.modulate = Color("f5dfa0")
-	prompt.outline_modulate = Color(0, 0, 0, 0.8)
-	# Just outside the doors (the podium front sits at cz - 2.5).
-	prompt.position = Vector3(VENTURES.x, 2.9, VENTURES.z - 3.6)
+	prompt.text = "ANGEL VENTURES · E"
+	prompt.font_size = 40
+	prompt.pixel_size = 0.004
+	prompt.position = Vector3(VENTURES.x, 2.1, VENTURES.z-3.6)
 	prompt.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	prompt.visibility_range_end = 18.0
 	add_child(prompt)
 
 
@@ -2884,6 +2628,19 @@ func _add_gable_roof(parent: Node, w: float, d: float, y: float, material: Mater
 		panel.position = Vector3(side * half_w * 0.5, y + rise * 0.5, 0)
 		panel.rotation.z = -side * angle
 		parent.add_child(panel)
+	var ends := SurfaceTool.new()
+	ends.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for side in [-1.0, 1.0]:
+		var a := Vector3(-w/2.0, y, side*d/2.0)
+		var b := Vector3(w/2.0, y, side*d/2.0)
+		var c := Vector3(0, y+rise, side*d/2.0)
+		for vertex in ([a, b, c] if side < 0 else [b, a, c]):
+			ends.add_vertex(vertex)
+	ends.generate_normals()
+	var gable := MeshInstance3D.new()
+	gable.mesh = ends.commit()
+	gable.material_override = Build.facade(Build.hex(0xc7bca7))
+	parent.add_child(gable)
 	var ridge := Build.cyl(0.12, 0.12, d + 1.0, 8, material)
 	ridge.rotation.x = PI / 2.0
 	ridge.position = Vector3(0, y + rise + 0.06, 0)
@@ -2940,17 +2697,17 @@ func _add_pool(parent: Node, pos: Vector3, w: float, d: float, fenced := true) -
 ## a recessed fenced pool. It deliberately does not use _add_building(), whose
 ## commercial facade grammar is wrong for a house.
 func _add_villa(cx: float, cz: float) -> void:
-	var lawn := Build.box(18.0, 0.12, 16.0, Build.facade(Build.hex(0x6f8a4e), "stucco"))
+	var lawn := Build.box(15.5, 0.12, 15.5, Build.facade(Build.hex(0x6f8a4e), "stucco"))
 	lawn.position = Vector3(cx, 0.06, cz)
 	add_child(lawn)
 	var drive := Build.box(4.2, 0.14, 8.0, Build.cmat(Build.hex(0x777980), 0.88))
 	drive.position = Vector3(cx - 5.0, 0.08, cz - 6.0)
 	add_child(drive)
 
-	var hw := 8.0 + randf() * 2.0
+	var hw := 7.0 + randf() * 1.0
 	var hd := 6.0 + randf() * 1.4
 	var hh := 4.0 + randf() * 1.0
-	var hx := cx + 0.8
+	var hx := cx + 1.8
 	var hz := cz - 0.2
 	var col: int = VILLA_PALETTE.pick_random()
 	var foundation := Build.box(hw + 0.5, 0.42, hd + 0.5, Build.cmat(Build.hex(0xb8ad98), 0.9))
@@ -2984,7 +2741,23 @@ func _add_villa(cx: float, cz: float) -> void:
 	awning.position = Vector3(hx, 3.15, hz - hd / 2.0 - 0.62)
 	add_child(awning)
 
-	var gw := 4.5
+	for side in [-1.0, 1.0]:
+		for offset in [-1.4, 1.4]:
+			var frame := Build.box(0.14, 1.65, 1.45, frame_m)
+			frame.position = Vector3(hx+side*(hw/2.0+0.08), 2.5, hz+offset)
+			add_child(frame)
+			var pane := Build.box(0.16, 1.35, 1.15, window_mat)
+			pane.position = frame.position + Vector3(side*0.035, 0, 0)
+			add_child(pane)
+	for offset in [-hw*0.26, hw*0.26]:
+		var frame := Build.box(1.65, 1.65, 0.14, frame_m)
+		frame.position = Vector3(hx+offset, 2.5, hz+hd/2.0+0.08)
+		add_child(frame)
+		var pane := Build.box(1.35, 1.35, 0.16, window_mat)
+		pane.position = frame.position + Vector3(0, 0, 0.035)
+		add_child(pane)
+
+	var gw := 3.5
 	var gx := hx - hw / 2.0 - gw / 2.0 + 0.6
 	var garage := Build.box(gw, 3.2, 5.0, Build.facade(Build.hex(col).darkened(0.05), "stucco"))
 	garage.position = Vector3(gx, 1.9, hz - 0.9)
@@ -3001,11 +2774,11 @@ func _add_villa(cx: float, cz: float) -> void:
 	_add_pool(self, Vector3(cx + 4.2, 0.2, cz + 5.4), 4.4, 2.5, true)
 
 	var fence_m := Build.mat(Build.hex(0xb9b2a0), 0.8)
-	for fz in [-8.0, 8.0]:
-		var f := Build.box(17.0, 1.1, 0.3, fence_m)
+	for fz in [-7.7, 7.7]:
+		var f := Build.box(15.5, 1.1, 0.3, fence_m)
 		f.position = Vector3(cx, 0.7, cz + fz)
 		add_child(f)
-	for fx in [-9.0, 9.0]:
+	for fx in [-7.7, 7.7]:
 		var f := Build.box(0.3, 1.1, 16.0, fence_m)
 		f.position = Vector3(cx + fx, 0.7, cz)
 		add_child(f)
@@ -3180,14 +2953,14 @@ func _add_palm_to(parent: Node, x: float, z: float) -> void:
 
 func _add_leafy_tree(x: float, z: float) -> void:
 	var trunk := Build.cyl(0.25, 0.35, 3.0, 8, Build.mat(Build.hex(0x6b4422), 0.95))
-	trunk.position = Vector3(x, 1.5, z)
+	trunk.position = Vector3(x, terrain_height(x, z) + 1.5, z)
 	add_child(trunk)
 	var foliage: int = [0x2c8a3a, 0x3aa84a, 0x1f6b2a].pick_random()
 	var fm := Build.mat(Build.hex(foliage), 0.85)
 	for j in 3:
 		var r := 1.0 + randf() * 0.6
 		var ball := Build.sphere(r, fm)
-		ball.position = Vector3(x + (randf() - 0.5) * 0.6, 3.0 + j * 0.5 + randf() * 0.4, z + (randf() - 0.5) * 0.6)
+		ball.position = Vector3(x + (randf() - 0.5) * 0.6, terrain_height(x, z) + 3.0 + j * 0.5 + randf() * 0.4, z + (randf() - 0.5) * 0.6)
 		add_child(ball)
 	buildings.append({"x": x, "z": z, "w": 0.7, "d": 0.7, "h": 3.0})
 
@@ -3262,7 +3035,7 @@ func _add_sunbather(x: float, z: float, female: bool, skin: int, suit: int, hair
 
 func _add_parasol(x: float, z: float, color: int) -> void:
 	var pole := Build.cyl(0.05, 0.05, 3.0, 8, Build.mat(Build.hex(0xdedede), 0.5, 0.6))
-	pole.position = Vector3(x, 1.5, z)
+	pole.position = Vector3(x, terrain_height(x, z) + 1.5, z)
 	add_child(pole)
 	var canopy := Build.cyl(0.0, 2.0, 0.5, 14, Build.mat(Build.hex(color), 0.85))
 	canopy.position = Vector3(x, 3.05, z)
@@ -3950,7 +3723,7 @@ func _add_outer_landscape() -> void:
 		else:
 			var rr := 0.8 + randf() * 1.8
 			var rock := Build.cyl(rr * 0.7, rr, rr * 1.6, 6, Build.mat(Build.hex(0x6e6e74), 1.0))
-			rock.position = Vector3(x, rr * 0.7, z)
+			rock.position = Vector3(x, terrain_height(x, z) + rr * 0.7, z)
 			add_child(rock)
 
 func _add_clouds(n: int) -> void:
@@ -4097,7 +3870,7 @@ func collides_at(x: float, z: float, r := 0.5, altitude := 0.0) -> bool:
 		return true
 	# Deep water south of the beach is impassable on the ground, but the first
 	# few metres are shallow wading space and aircraft remain unrestricted.
-	if z > WORLD_HALF + 12.0 and altitude < 5.0:
+	if coast_distance(x, z) < -2.0 and altitude < 5.0:
 		return true
 	# The hidden space facility and its approach sit beyond the old wilderness
 	# edge — explicitly walkable regardless of the coastline rule below. See
@@ -4253,3 +4026,33 @@ class ForbesBoardUI extends Control:
 			draw_line(Vector2(hc.x - hr * 0.44, ey - hr * 0.2), Vector2(hc.x - hr * 0.18, ey - hr * 0.24), hair.darkened(0.2), 2.5)
 			draw_line(Vector2(hc.x + hr * 0.18, ey - hr * 0.24), Vector2(hc.x + hr * 0.44, ey - hr * 0.2), hair.darkened(0.2), 2.5)
 			draw_line(hc + Vector2(-hr * 0.18, hr * 0.42), hc + Vector2(hr * 0.18, hr * 0.42), skin.darkened(0.4), 2.5)
+
+
+func camera_clearance(origin: Vector3, desired: Vector3) -> Vector3:
+	var distance := origin.distance_to(desired)
+	var steps := maxi(1, int(ceil(distance / 0.18)))
+	for i in range(1, steps + 1):
+		var point := origin.lerp(desired, float(i) / steps)
+		var blocked := point.y < terrain_height(point.x, point.z) + 0.25
+		if buildings.size() != _bgrid_count:
+			_rebuild_building_grid()
+		var nearby: Array = _bgrid.get(Vector2i(floori(point.x/_BGRID_CELL), floori(point.z/_BGRID_CELL)), [])
+		for b in nearby:
+			if point.y > float(b.h) + 0.25:
+				continue
+			var local := Vector2(point.x-b.x, point.z-b.z).rotated(float(b.get("yaw", 0.0)))
+			if absf(local.x) < b.w/2.0+0.25 and absf(local.y) < b.d/2.0+0.25:
+				blocked = true
+				break
+		if blocked:
+			return origin.lerp(desired, float(maxi(0, i-2))/steps)
+	return desired
+
+
+func swept_collision(from: Vector3, to: Vector3, radius: float) -> bool:
+	var steps := maxi(1, int(ceil(from.distance_to(to) / maxf(0.2, radius * 0.5))))
+	for i in range(1, steps + 1):
+		var point := from.lerp(to, float(i)/steps)
+		if collides_at(point.x, point.z, radius, point.y):
+			return true
+	return false

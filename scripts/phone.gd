@@ -25,6 +25,8 @@ func _ready() -> void:
 
 
 func _build() -> void:
+	if _root != null:
+		_root.queue_free()
 	_root = Control.new()
 	_root.set_anchors_preset(Control.PRESET_FULL_RECT)
 	_root.mouse_filter = Control.MOUSE_FILTER_STOP
@@ -51,11 +53,25 @@ func _build() -> void:
 
 	var col := VBoxContainer.new()
 	col.add_theme_constant_override("separation", 7)
-	col.custom_minimum_size = Vector2(340, 0)
+	col.custom_minimum_size = Vector2(360, 0)
 	panel.add_child(col)
 
 	col.add_child(_lbl("PHONE", 28, GOLD))
+	if GameState.fame >= 20.0:
+		col.add_child(_lbl("FREE HARBOR is filming you.", 13, GOLD))
 	col.add_child(_rule())
+
+	if GameState.has_diss() and Forbes.rival_alive(String(GameState.last_diss.name)):
+		var who := String(GameState.last_diss.name)
+		var co := String(GameState.last_diss.get("company", ""))
+		_section(col, "REVENGE  ·  %s" % who.to_upper())
+		if co != "":
+			col.add_child(_lbl(co, 12, FAINT))
+		_btn(col, "Ruin them  —  leak the books", "revenge_ruin")
+		_btn(col, "Buy them out  —  take the company", "revenge_buy")
+		_btn(col, "Hunt them  —  go end it", "revenge_hunt")
+		col.add_child(_rule())
+
 	_section(col, "VEHICLES")
 	_btn(col, "Call a Sports Car", "car_sports")
 	_btn(col, "Call the Formula 1", "car_f1")
@@ -88,6 +104,7 @@ func _btn(col: VBoxContainer, text: String, id: String) -> void:
 
 # ---------------- API ----------------
 func open() -> void:
+	_build()
 	_open = true
 	_root.visible = true
 	UiNav.apply.call_deferred(_root)

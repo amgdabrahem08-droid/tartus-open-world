@@ -182,6 +182,18 @@ static func build_model(kind: String, skin := -1, shirt := -1, pants := 0x2a2a3a
 			var idx := _find_bone_like(sk, cfg.bones[logical])
 			bonemap[logical] = (sk.get_bone_name(idx) if idx >= 0 else "")
 
+		# Resolve knee and elbow joints for an articulated gait on each rig.
+		var joint_names := {
+			"ubc": ["calf_l", "calf_r", "lowerarm_l", "lowerarm_r"],
+			"peter": ["calf_l", "calf_r", "lowerarm_l", "lowerarm_r"],
+			"vip_suit": ["leftleg", "rightleg", "leftforearm", "rightforearm"],
+			"guard_suit": ["shin.l", "shin.r", "forearm.l", "forearm.r"],
+			"nathan": ["lowerleg_l", "lowerleg_r", "lowerarm_l", "lowerarm_r"]}
+		var logical_joints := ["knee_l", "knee_r", "elbow_l", "elbow_r"]
+		for j in 4:
+			var joint := _find_bone_like(sk, joint_names[kind][j])
+			bonemap[logical_joints[j]] = sk.get_bone_name(joint) if joint >= 0 else ""
+
 		# This rig's measured arm-down angle (see _measure_arm_down) — one
 		# measurement per KIND, not per instance, since the rest pose baked
 		# into the imported scene is identical for every spawn of the same kind.
@@ -333,6 +345,11 @@ static func sit(node: Node3D) -> void:
 ## _pose() below no-ops on it, so that joint just holds its rest pose instead
 ## of erroring (a per-joint idle fallback for a partially-mappable rig).
 static func _pose_walk(sk: Skeleton3D, leg: float, arm: float, bonemap: Dictionary, arm_down := ARM_DOWN) -> void:
+	# Swing leg bends during recovery; stance leg stays nearly straight.
+	_pose(sk, bonemap.get("knee_r", ""), Quaternion(_X, maxf(0.0, leg) * 1.25))
+	_pose(sk, bonemap.get("knee_l", ""), Quaternion(_X, maxf(0.0, -leg) * 1.25))
+	_pose(sk, bonemap.get("elbow_r", ""), Quaternion(_X, -0.12-absf(arm)*0.45))
+	_pose(sk, bonemap.get("elbow_l", ""), Quaternion(_X, -0.12-absf(arm)*0.45))
 	_pose(sk, bonemap.get("thigh_r", "thigh_r"), Quaternion(_X, -leg))
 	_pose(sk, bonemap.get("thigh_l", "thigh_l"), Quaternion(_X, leg))
 	_pose(sk, bonemap.get("upperarm_r", "upperarm_r"), Quaternion(_X, arm) * Quaternion(_Z, arm_down))
@@ -364,7 +381,7 @@ static func _pose(sk: Skeleton3D, bone: String, qc: Quaternion) -> void:
 		var p := sk.get_bone_parent(idx)
 		e = {
 			"idx": idx,
-			"pb": sk.get_bone_global_pose(p).basis.get_rotation_quaternion(),
+			"pb": sk.get_bone_global_rest(p).basis.get_rotation_quaternion() if p >= 0 else Quaternion.IDENTITY,
 			"rest": sk.get_bone_rest(idx).basis.get_rotation_quaternion(),
 		}
 		cache[bone] = e

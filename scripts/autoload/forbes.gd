@@ -16,6 +16,8 @@ signal updated
 ## player, or the player claims the #1 spot for the first time — game.gd
 ## forwards these to hud.show_objective, same as Ventures.toast.
 signal toast(text: String)
+## A rival just publicly crossed the player — game.gd arms Phone → REVENGE.
+signal dissed(rname: String, company: String)
 
 const TICK := 4.0                          # real seconds between Forbes ticks
 const MIN_WORTH := 1_000_000_000.0         # no rival ever craters below $1B
@@ -91,7 +93,8 @@ func _tick() -> void:
 			r.worth = clampf(r.worth * (1.06 + randf() * 0.14), MIN_WORTH, MAX_WORTH)
 			var now_ahead: bool = r.worth > player_worth
 			if now_ahead and not was_ahead and _overtake_cd <= 0.0:
-				toast.emit(String(r.name) + " just closed a mega-deal — ahead of you again.")
+				toast.emit(String(r.name) + " just closed a mega-deal — ahead of you again. Phone → REVENGE.")
+				dissed.emit(String(r.name), String(r.company))
 				_overtake_cd = OVERTAKE_COOLDOWN
 
 	if player_rank() == 1 and not reached_number_one:
@@ -158,6 +161,29 @@ func rival_alive(rname: String) -> bool:
 		if r.name == rname:
 			return r.get("alive", true)
 	return false
+
+
+func company_of(rname: String) -> String:
+	for r in rivals:
+		if r.name == rname:
+			return String(r.company)
+	return ""
+
+
+## Leak the books — they bleed ~38% of net worth, you skim a slice. Free.
+func ruin_rival(rname: String) -> float:
+	for r in rivals:
+		if r.name == rname and r.get("alive", true):
+			var cut: float = r.worth * 0.38
+			r.worth = clampf(r.worth - cut, MIN_WORTH, MAX_WORTH)
+			updated.emit()
+			return cut * 0.12
+	return 0.0
+
+
+## Hostile takeover — they leave the list, you inherit the empire. Easy.
+func buyout_rival(rname: String) -> float:
+	return kill_rival(rname)
 
 
 ## The live text every FORBES banner in world.gd displays — top 5, plus the

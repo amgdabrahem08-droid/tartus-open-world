@@ -32,6 +32,12 @@ var island_progress: float = 0.0
 # ticker price.
 var he3_cargo: float = 0.0
 
+# Fame — 0..100. One loud stunt fills it; the streets notice while it's up.
+# Decays slowly so "famous by dinner" lasts the evening, not three seconds.
+var fame: float = 0.0
+# Last person who crossed you — {name, company}. Phone REVENGE reads this.
+var last_diss: Dictionary = {}
+
 func init_weapon_ammo() -> void:
 	weapon_ammo.clear()
 	for w in WeaponDB.LIST:
@@ -50,7 +56,22 @@ func reset_run() -> void:
 	island_stage = 0
 	island_progress = 0.0
 	he3_cargo = 0.0
+	fame = 0.0
+	last_diss = {}
 	init_weapon_ammo()
+
+
+## One-tap "they crossed you" — overwrites the previous target. Phone → REVENGE.
+func note_diss(rname: String, company: String) -> void:
+	last_diss = {"name": rname, "company": company}
+
+
+func clear_diss() -> void:
+	last_diss = {}
+
+
+func has_diss() -> bool:
+	return not last_diss.is_empty() and String(last_diss.get("name", "")) != ""
 
 func get_ammo(w: Dictionary) -> float:
 	if w.ammo == INF:
@@ -64,3 +85,8 @@ func add_respect(amt: float) -> void:
 ## Nudge happiness, clamped to 0..100.
 func add_happiness(amt: float) -> void:
 	happiness = clampf(happiness + amt, 0.0, 100.0)
+
+
+## Nudge fame, clamped to 0..100.
+func add_fame(amt: float) -> void:
+	fame = clampf(fame + amt, 0.0, 100.0)

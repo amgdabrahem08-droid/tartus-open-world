@@ -181,6 +181,8 @@ var cam_yaw := 0.0
 var cam_pitch := 0.3
 var cam_dist := 6.5
 var _shake_amt := 0.0            # current camera-shake intensity, decays each frame
+var _foot_vy := 0.0
+var _stride_phase := 0.0
 var _walk_vel := Vector2.ZERO    # smoothed on-foot velocity (x, z)
 var aiming := false          # on foot, holding Space: first-person zoomed aim
 const CAM_FOV_HIP := 70.0
@@ -205,6 +207,13 @@ var guards: Array = []      # bodyguards escorting the VIPs
 # celebration can't interact with combat/wanted systems. See
 # _spawn_celebration / _update_celebrations.
 var celebrants: Array = []
+# Fame / revenge — one stunt makes the streets film you; one diss puts
+# their name on the phone. Both are meant to be easy and loud.
+var _fame_cd := 0.0
+var _spectacle_latched := false
+var _near_dissed: Dictionary = {}
+var _hunt_name := ""
+var _hunt_pos := Vector2.ZERO
 var bullets: Array = []
 var particles: Array = []
 var pickups: Array = []
@@ -333,6 +342,7 @@ func _ready() -> void:
 	_refresh_weapon_model()
 
 	camera = Camera3D.new()
+	camera.near = 0.08
 	camera.fov = 70.0
 	camera.position = Vector3(0, 8, 12)
 	# Far enough to see the space-vista planet spheres (Earth ball bottom at
@@ -388,7 +398,12 @@ func _ready() -> void:
 	add_child(venture_terminal)
 	venture_terminal.closed.connect(_on_terminal_closed)
 	Ventures.toast.connect(func(text: String) -> void: _show_objective(text, 4.5))
-	Forbes.toast.connect(func(text: String) -> void: _show_objective(text, 5.5))
+	Forbes.toast.connect(func(text: String) -> void:
+		_show_objective(text, 5.5)
+		if text.begins_with("You are the richest"):
+			_become_famous("YOU ARE #1. The whole city is chanting.", true)
+	)
+	Forbes.dissed.connect(_on_rival_dissed)
 
 	# Touch overlay for tablet builds; desktop keeps the keyboard/mouse path.
 	if OS.has_feature("mobile"):
@@ -419,11 +434,13 @@ func _setup_environment() -> void:
 	env.tonemap_exposure = 0.9
 	env.ssao_enabled = true
 	env.ssao_radius = 1.6
-	env.ssao_intensity = 1.5
+	env.ssao_intensity = 1.8
+	env.ssr_enabled = true
+	env.ssr_max_steps = 48
 	env.fog_enabled = true
 	# A touch heavier than stock for the warm LA smog-haze on distant blocks,
 	# but kept light enough that aerial / flying views stay readable.
-	env.fog_density = 0.0013
+	env.fog_density = 0.00055
 	env.fog_sky_affect = 0.22
 	# Aerial perspective — distant coastline and sea haze into the sky instead
 	# of presenting a hard horizon line.
@@ -473,6 +490,11 @@ func _on_start() -> void:
 	_clear_celebration()
 	_pending_milestones.clear()
 	_milestone_check_t = 0.0
+	_fame_cd = 0.0
+	_spectacle_latched = false
+	_near_dissed.clear()
+	_hunt_name = ""
+	_hunt_pos = Vector2.ZERO
 	var s := world.find_safe_spawn()
 	player_pos = Vector3(s.x, 0, s.y)
 	player_node.position = player_pos
@@ -1014,6 +1036,7 @@ func _on_race_finished() -> void:
 	var won: int = RaceManager.settle(place)
 	if place == 1:
 		_show_objective("WON THE GRAND PRIX!  P1  —  payout $%d" % won, 9.0)
+		_become_famous("GRAND PRIX CHAMPION — the stands are chanting your name.", true)
 	elif won > 0:
 		_show_objective("Finished P%d of %d  —  payout $%d" % [place, race_total, won], 9.0)
 	else:
@@ -1301,6 +1324,12 @@ func _on_phone_action(id: String) -> void:
 			player_armor = player_max_armor
 			GameState.init_weapon_ammo()
 			_show_objective("Full heal and ammo restock.", 4.0)
+		"revenge_ruin":
+			_revenge_ruin()
+		"revenge_buy":
+			_revenge_buy()
+		"revenge_hunt":
+			_revenge_hunt()
 		"bribe":
 			if GameState.money >= 50000:
 				GameState.money -= 50000
@@ -1457,6 +1486,7 @@ func _process(delta: float) -> void:
 	_update_pending_milestones()
 	_update_celebrations(dt)
 	_update_president(dt)
+	_update_fame(dt)
 	_update_my_detail(dt)
 	_update_wanted(dt)
 	_update_bullets(dt)
@@ -1597,16 +1627,16 @@ func _update_moon_walk(dt: float) -> void:
 	var clamped := world.moon_clamp_xz(player_pos.x, player_pos.z)
 	player_pos.x = clamped.x
 	player_pos.z = clamped.y
-	var bob: float = absf(sin(walk_phase * 0.45)) * (0.55 if l > 0.0 else 0.0)
+	_stride_phase += minf(l, 1.0) * spd * dt * TAU / 2.6
 	var gy: float = world.moon_height(player_pos.x, player_pos.z)
-	# Snap up if anything left us under the plate (craft exit, suit, bug).
-	if player_pos.y < gy - 1.5:
+	if player_pos.y <= gy + 0.025:
 		player_pos.y = gy
-	else:
-		player_pos.y = gy + bob
+		_foot_vy = 0.65 if l > 0.1 else 0.0
+	_foot_vy -= 1.62 * dt
+	player_pos.y = maxf(gy, player_pos.y + _foot_vy * dt)
 	player_node.position = player_pos
 	player_node.rotation.y = player_yaw
-	Human.animate(player_node, walk_phase * 0.6, l > 0.0, 0.7, 0.49)
+	Human.animate(player_node, _stride_phase, l > 0.0, 0.35, 0.25)
 
 	# Step back onto the parked suit to re-wear it (and re-arm V summon).
 	if suit_node != null and suit_state == "none":
@@ -1625,17 +1655,18 @@ func _update_on_foot(dt: float) -> void:
 	var mx := _move_x()
 	var mz := _move_z()
 	var l := sqrt(mx * mx + mz * mz)
-	var spd := 8.0 if _sprint_held() else 4.5
+	var spd := 6.2 if _sprint_held() else 2.8
 	var target_vel := Vector2.ZERO
 	if l > 0.0:
 		mx /= l
 		mz /= l
 		var fwd := Vector3(-sin(cam_yaw), 0, -cos(cam_yaw))
 		var rgt := Vector3(cos(cam_yaw), 0, -sin(cam_yaw))
-		target_vel = Vector2(rgt.x * mx + fwd.x * mz, rgt.z * mx + fwd.z * mz) * spd
+		target_vel = Vector2(rgt.x * mx + fwd.x * mz, rgt.z * mx + fwd.z * mz) * spd * minf(l, 1.0)
 	# A short accelerate/brake ramp instead of instant velocity — keeps starts
 	# and stops from feeling teleported without making the player floaty.
-	_walk_vel = _walk_vel.move_toward(target_vel, 50.0 * dt)
+	var previous_pos := player_pos
+	_walk_vel = _walk_vel.move_toward(target_vel, (18.0 if l > 0.0 else 26.0) * dt)
 	var moving := _walk_vel.length_squared() > 0.04
 	if moving:
 		var dx := _walk_vel.x * dt
@@ -1653,13 +1684,22 @@ func _update_on_foot(dt: float) -> void:
 				minf(1.0, dt * 14.0))
 	# Walk up onto raised surfaces — the river bridges and the dock jetties.
 	# Pass the current altitude so the office floor only applies upstairs.
-	player_pos.y = world.surface_height(player_pos.x, player_pos.z, player_pos.y)
+	var floor_y := world.surface_height(player_pos.x, player_pos.z, player_pos.y)
+	if player_pos.y <= floor_y + 0.35:
+		player_pos.y = floor_y
+		_foot_vy = 0.0
+	else:
+		_foot_vy -= 9.81 * dt
+		player_pos.y = maxf(floor_y, player_pos.y + _foot_vy * dt)
+	var travelled := Vector2(player_pos.x-previous_pos.x, player_pos.z-previous_pos.z).length()
+	_stride_phase += travelled * TAU / (2.5 if _sprint_held() else 1.65)
+	moving = travelled > 0.0005
 	player_node.position = player_pos
 	player_node.rotation.y = player_yaw
 	# Clear any residual lean carried over from a bike or suit flight.
 	player_node.rotation.x = 0.0
 	player_node.rotation.z = 0.0
-	Human.animate(player_node, walk_phase, moving, 0.7, 0.49)
+	Human.animate(player_node, _stride_phase, moving, 0.65 if _sprint_held() else 0.4, 0.32)
 
 	# Step onto the parked Iron Man suit to put it on.
 	if suit_node != null and suit_state == "none":
@@ -1825,7 +1865,7 @@ func _update_car(v: Dictionary, dt: float) -> void:
 
 	var dx: float = sin(v.yaw) * v.speed * dt
 	var dz: float = cos(v.yaw) * v.speed * dt
-	if not world.collides_at(v.pos.x + dx, v.pos.z, 1.2, v.pos.y):
+	if not world.swept_collision(v.pos, v.pos + Vector3(dx, 0, 0), 1.2):
 		v.pos.x += dx
 	else:
 		_spawn_sparks(v.pos.x, 0.8, v.pos.z, 4)
@@ -1833,7 +1873,7 @@ func _update_car(v: Dictionary, dt: float) -> void:
 		v.hp -= abs(v.speed) * 0.3
 		v.speed *= -0.3
 		AudioFX.hit()
-	if not world.collides_at(v.pos.x, v.pos.z + dz, 1.2, v.pos.y):
+	if not world.swept_collision(v.pos, v.pos + Vector3(0, 0, dz), 1.2):
 		v.pos.z += dz
 	else:
 		_spawn_sparks(v.pos.x, 0.8, v.pos.z, 4)
@@ -1843,6 +1883,14 @@ func _update_car(v: Dictionary, dt: float) -> void:
 		AudioFX.hit()
 	# Ride up and over the elevated river bridges.
 	v.pos.y = world.surface_height(v.pos.x, v.pos.z)
+	var forward := Vector2(sin(v.yaw), cos(v.yaw)) * 1.4
+	var right := Vector2(cos(v.yaw), -sin(v.yaw)) * 0.8
+	var front_h := world.surface_height(v.pos.x+forward.x, v.pos.z+forward.y)
+	var rear_h := world.surface_height(v.pos.x-forward.x, v.pos.z-forward.y)
+	var right_h := world.surface_height(v.pos.x+right.x, v.pos.z+right.y)
+	var left_h := world.surface_height(v.pos.x-right.x, v.pos.z-right.y)
+	v.node.rotation.x = lerp_angle(v.node.rotation.x, -atan2(front_h-rear_h, 2.8)+pitch_t, lean_k)
+	v.node.rotation.z = lerp_angle(v.node.rotation.z, atan2(right_h-left_h, 1.6)+roll_t, lean_k)
 	v.node.position = v.pos
 	v.node.rotation.y = v.yaw
 
@@ -3163,9 +3211,25 @@ func _update_npcs(dt: float) -> void:
 		if n.walk_timer <= 0.0:
 			n.walk_timer = 1.0 + randf() * 3.0
 			n.yaw = randf() * TAU
+		var fan: float = float(n.get("fan", 0.0))
+		var nearby: bool = n.pos.distance_squared_to(player_pos) < 18.0 * 18.0
+		if GameState.fame >= 18.0 and nearby:
+			fan = maxf(fan, 2.5)
 		if _now - last_fire_at < 4.0:
 			if n.pos.distance_squared_to(player_pos) < 900.0:
 				n.yaw = atan2(n.pos.x - player_pos.x, n.pos.z - player_pos.z)
+				fan = 0.0
+		if fan > 0.0:
+			n.fan = fan - dt
+			var fdx: float = player_pos.x - n.pos.x
+			var fdz: float = player_pos.z - n.pos.z
+			n.yaw = atan2(fdx, fdz)
+			n.walk_phase += dt * 10.0
+			Human.animate(n.node, n.walk_phase, true, 0.35, 0.95)
+			n.node.position = n.pos
+			n.node.position.y = absf(sin(n.walk_phase)) * 0.18
+			n.node.rotation.y = n.yaw
+			continue
 		var nx: float = n.pos.x + sin(n.yaw) * 2.5 * dt
 		var nz: float = n.pos.z + cos(n.yaw) * 2.5 * dt
 		if not world.collides_at(nx, n.pos.z, 0.4):
@@ -3622,6 +3686,10 @@ func _update_vips(dt: float) -> void:
 					AudioFX.coin()
 					_show_objective("%s IS DEAD — their %s empire is yours. The whole city is hunting you."
 						% [v.rival, Forbes.short_money(gained)], 10.0)
+					if GameState.last_diss.get("name", "") == v.rival:
+						GameState.clear_diss()
+					_hunt_name = ""
+					_become_famous("You ended %s. Free Harbor will not shut up about it." % v.rival, true)
 				# Assassinating a public figure is instant maximum heat
 				# (_raise_wanted scales its input — go straight to 5 stars,
 				# after letting it run its cop-timer/mood side effects).
@@ -3809,6 +3877,7 @@ func _update_pending_milestones() -> void:
 	_show_objective(tier.msg, 8.0)
 	GameState.add_respect(tier.respect)
 	_spawn_celebration(int(tier.celebrants))
+	_become_famous("", false)
 
 
 ## Spawns `n` civilians just off-screen around the player to come congratulate
@@ -4249,7 +4318,7 @@ func _spawn_spacecraft() -> void:
 func _spacecraft_ground_y(v: Dictionary) -> float:
 	if v.leg == "moon":
 		return world.moon_height(v.pos.x, v.pos.z)
-	return 0.0
+	return world.surface_height(v.pos.x, v.pos.z)
 
 
 ## Small thruster dust puff under the spacecraft on lift-off/landing — sandy
@@ -4414,7 +4483,8 @@ func _update_spacecraft(v: Dictionary, dt: float) -> void:
 			v.roll = move_toward(v.roll, 0.0, 1.4 * dt)
 			var agl: float = v.pos.y - _spacecraft_ground_y(v)
 			var max_sink: float = clampf(CRAFT_DESCENT_SPEED + agl * 0.28, CRAFT_DESCENT_SPEED, 95.0)
-			v.vy = move_toward(v.vy, climb * max_sink - 3.0, 40.0 * dt)
+			var safe_sink := minf(max_sink, sqrt(maxf(0.0, agl) * 8.0) + 0.5)
+			v.vy = move_toward(v.vy, climb * safe_sink, 18.0 * dt)
 			v.yaw += turn * 0.9 * dt
 			v.speed = move_toward(v.speed, thrust * 24.0, 30.0 * dt)
 			var fwd2 := Vector3(sin(v.yaw), 0, cos(v.yaw))
@@ -5796,7 +5866,7 @@ func _update_daynight() -> void:
 	moon.rotation = Vector3(elev_angle, theta + PI, 0.0)
 	moon.light_energy = moonf * 0.5
 
-	var day := Color("cfc3ad")        # warm coastal haze without a heavy brown cast
+	var day := Color("b9cad3")        # warm coastal haze without a heavy brown cast
 	var dusk := Color("b06a44")
 	var night := Color("0a0a22")
 	var fog: Color
@@ -5810,7 +5880,7 @@ func _update_daynight() -> void:
 
 	var dayk := clampf((elev + 0.15) / 0.5, 0.0, 1.0)
 	sky_mat.sky_top_color = Color(0.02, 0.03, 0.09).lerp(Color(0.26, 0.45, 0.70), dayk)
-	sky_mat.sky_horizon_color = Color(0.07, 0.05, 0.13).lerp(Color(0.85, 0.80, 0.69), dayk)
+	sky_mat.sky_horizon_color = Color(0.07, 0.05, 0.13).lerp(Color(0.69, 0.77, 0.83), dayk)
 	sky_mat.ground_horizon_color = sky_mat.sky_horizon_color
 	sky_mat.ground_bottom_color = sky_mat.sky_horizon_color.darkened(0.4)
 	# Ambient light comes from a COLOR, not the sky: the old sky-sourced
@@ -5820,10 +5890,11 @@ func _update_daynight() -> void:
 	if space_state == "":
 		env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 		env.ambient_light_color = Color(0.46, 0.52, 0.68).lerp(Color(0.78, 0.79, 0.78), dayk)
-		env.ambient_light_energy = 0.38 + dayk * 0.22
+		env.ambient_light_energy = 0.3 + dayk * 0.08
 
 	var night_amt := clampf(1.0 - (elev + 0.05) * 2.5, 0.0, 1.0)
-	world.window_mat.emission_energy_multiplier = night_amt * 1.2
+	world.window_mat.emission_energy_multiplier = night_amt * 0.45
+	world.architecture.window_material.set_shader_parameter("night", night_amt)
 	for m in world.lamp_mats:
 		m.emission_energy_multiplier = night_amt * 2.5
 	# Street lamps cast REAL light (72 shadowless omnis city-wide) — glowing
@@ -5860,7 +5931,7 @@ func _update_camera(dt: float) -> void:
 		env.fog_density = 0.075
 		env.fog_sky_affect = 0.0
 	else:
-		env.fog_density = 0.0013
+		env.fog_density = 0.00055
 		env.fog_sky_affect = 0.22
 	# Sniper scope: a progressive 0..1 ramp (NOT an instant snap) toward fully
 	# scoped-in, advancing while aiming with the sniper equipped and retreating
@@ -5966,7 +6037,19 @@ func _update_camera(dt: float) -> void:
 		cos(cam_yaw) * cam_dist * cos(cam_pitch))
 	var desired := Vector3(target.x + off.x, max(1.2, target.y + off.y), target.z + off.z)
 	var chase: float = 0.72 if is_rocket else (0.88 if is_plane else 0.85)
-	camera.position = camera.position.lerp(desired, 1.0 - pow(chase, k)) + shake
+	var camera_origin := target + Vector3.UP * look_h
+	if in_car == null and not _on_moon_surface() and suit_state != "on":
+		desired = world.camera_clearance(camera_origin, desired)
+		if desired.distance_to(camera_origin) < 1.4:
+			var raised := world.camera_clearance(camera_origin, camera_origin + Vector3.UP*3.0 + off.normalized()*1.5)
+			if raised.distance_to(camera_origin) > desired.distance_to(camera_origin):
+				desired = raised
+	var next_camera := camera.position.lerp(desired, 1.0 - pow(chase, k)) + shake
+	if in_car == null and not _on_moon_surface() and suit_state != "on":
+		next_camera = world.camera_clearance(camera_origin, next_camera)
+	camera.position = next_camera
+	if in_car == null and suit_state == "none":
+		player_node.visible = camera.position.distance_to(camera_origin) > 1.1
 	camera.look_at(Vector3(target.x, target.y + look_h, target.z))
 
 
@@ -6074,11 +6157,20 @@ func _push_hud() -> void:
 
 
 func _waypoint_text() -> String:
-	# Point at the President while his motorcade is out, otherwise the airport.
+	# Hunt target first (phone revenge), then the President, else the airport.
 	var label := "AIRPORT"
 	var tx: float = CityWorld.AIRPORT.x
 	var tz: float = CityWorld.AIRPORT.z
-	if pres_state != "home" and president != null:
+	if _hunt_name != "":
+		label = _hunt_name.split(" ")[0].to_upper()
+		tx = _hunt_pos.x
+		tz = _hunt_pos.y
+		for v in vips:
+			if v.get("rival", "") == _hunt_name:
+				tx = v.pos.x
+				tz = v.pos.z
+				break
+	elif pres_state != "home" and president != null:
 		label = "PRESIDENT"
 		tx = president.pos.x
 		tz = president.pos.z
@@ -6093,3 +6185,146 @@ func _waypoint_text() -> String:
 
 func _show_objective(text: String, secs := 3.5) -> void:
 	hud.show_objective(text, secs)
+
+
+# =====================================================================
+# Fame + revenge — easy IRL-impossible payoffs
+# =====================================================================
+func _on_rival_dissed(rname: String, company: String) -> void:
+	GameState.note_diss(rname, company)
+
+
+func _update_fame(dt: float) -> void:
+	_fame_cd = maxf(0.0, _fame_cd - dt)
+	if GameState.fame > 0.0:
+		GameState.fame = maxf(0.0, GameState.fame - dt * 0.035)
+	_check_spectacle_fame()
+	_check_near_diss(dt)
+
+
+## Suit / shuttle / plane over downtown = famous tonight. Lands reset the latch
+## so the next flyover can fire again.
+func _check_spectacle_fame() -> void:
+	var over_city := absf(player_pos.x) < 220.0 and absf(player_pos.z) < 220.0 \
+		and not _on_moon_surface() and space_state != "space" and space_state != "space_climb"
+	var airborne: bool = player_pos.y > 22.0
+	var spectacle: bool = suit_state == "on"
+	if in_car != null:
+		spectacle = spectacle or bool(in_car.is_plane) or bool(in_car.get("is_rocket", false)) \
+			or bool(in_car.get("is_spacecraft", false)) or bool(in_car.get("is_heli", false))
+	var flying: bool = airborne and spectacle
+	if flying and over_city:
+		if not _spectacle_latched:
+			_spectacle_latched = true
+			if suit_state == "on":
+				_become_famous("IRON MAN over Free Harbor — every phone is up.", true)
+			elif in_car != null and in_car.get("is_rocket", false):
+				_become_famous("The Shuttle just painted the skyline. You're a headline.", true)
+			else:
+				_become_famous("The whole downtown is filming you.", true)
+	elif player_pos.y < 6.0:
+		_spectacle_latched = false
+
+
+## Walk up to a Forbes tycoon and they look through you — revenge is one tap.
+func _check_near_diss(_dt: float) -> void:
+	for v in vips:
+		if not v.has("rival") or v.hp <= 0.0:
+			continue
+		if _near_dissed.get(v.rival, false):
+			continue
+		if v.pos.distance_squared_to(player_pos) > 9.0 * 9.0:
+			continue
+		_near_dissed[v.rival] = true
+		GameState.note_diss(String(v.rival), Forbes.company_of(String(v.rival)))
+		_show_objective("%s looked right through you. Phone → REVENGE." % v.rival, 6.0)
+		return
+
+
+## `announce` false = just juice fame (milestones already toasted).
+func _become_famous(reason: String, announce: bool) -> void:
+	var first := GameState.fame < 18.0
+	if _fame_cd > 0.0:
+		GameState.add_fame(10.0)
+		return
+	_fame_cd = 16.0
+	GameState.add_fame(48.0)
+	GameState.add_respect(3.0)
+	GameState.add_happiness(2.0)
+	for n in npcs:
+		if n.pos.distance_squared_to(player_pos) < 24.0 * 24.0:
+			n.fan = 7.0 + randf() * 4.0
+	if celebrants.size() < 8:
+		_spawn_celebration(mini(5, 8 - celebrants.size()))
+	if announce and reason != "":
+		_show_objective(reason, 6.5)
+	elif first:
+		_show_objective("FREE HARBOR NEWS — they're filming you.", 5.5)
+
+
+func _revenge_ruin() -> void:
+	if not GameState.has_diss():
+		return
+	var who := String(GameState.last_diss.name)
+	var skim: float = Forbes.ruin_rival(who)
+	if skim <= 0.0:
+		_show_objective("%s is already gone." % who, 3.5)
+		GameState.clear_diss()
+		return
+	GameState.money += int(skim)
+	AudioFX.coin()
+	GameState.add_fame(20.0)
+	_show_objective("You leaked the books. %s is bleeding — you skimmed %s. The city saw it."
+		% [who, Forbes.short_money(skim)], 8.0)
+	_become_famous("", false)
+
+
+func _revenge_buy() -> void:
+	if not GameState.has_diss():
+		return
+	var who := String(GameState.last_diss.name)
+	var co := String(GameState.last_diss.get("company", "their company"))
+	var gained: float = Forbes.buyout_rival(who)
+	if gained <= 0.0:
+		_show_objective("%s is already gone." % who, 3.5)
+		GameState.clear_diss()
+		return
+	GameState.money += int(gained)
+	AudioFX.coin()
+	GameState.clear_diss()
+	_hunt_name = ""
+	_despawn_rival_body(who)
+	_show_objective("YOU BOUGHT %s. %s is yours. Lawyers already filed."
+		% [co.to_upper(), who], 9.0)
+	_become_famous("Hostile takeover. Free Harbor just learned your name.", true)
+
+
+func _revenge_hunt() -> void:
+	if not GameState.has_diss():
+		return
+	var who := String(GameState.last_diss.name)
+	_hunt_name = who
+	_hunt_pos = Vector2.ZERO
+	for i in Forbes.rivals.size():
+		if String(Forbes.rivals[i].name) == who:
+			_hunt_pos = RIVAL_TURFS[i % RIVAL_TURFS.size()]
+			break
+	for v in vips:
+		if v.get("rival", "") == who:
+			_hunt_pos = Vector2(v.pos.x, v.pos.z)
+			break
+	_show_objective("They're downtown. Go end it. Waypoint locked on %s." % who, 6.5)
+
+
+func _despawn_rival_body(rname: String) -> void:
+	for v in vips:
+		if v.get("rival", "") != rname:
+			continue
+		for g in v.guards:
+			if is_instance_valid(g.node):
+				g.node.queue_free()
+			guards.erase(g)
+		if is_instance_valid(v.node):
+			v.node.queue_free()
+		vips.erase(v)
+		return

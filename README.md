@@ -326,6 +326,14 @@ under their respective licenses:
   `scripts/game.gd`'s `_make_spacecraft`; the model and its license live in
   `assets/vehicles/spacecraft/`.
 
+- **Combat audio (CC0)** — recorded firearm takes from the
+  [Free Firearm Sound Library](https://opengameart.org/content/the-free-firearm-sound-library)
+  and OpenGameArt [Gunshots](https://opengameart.org/content/gunshots)
+  (pistol / magnum / black powder), plus Kenney
+  [Sci-fi Sounds](https://kenney.nl/assets/sci-fi-sounds) layers on the
+  Iron Man repulsor. Baked in `tools/bake_combat_sfx.py`; see
+  `assets/audio/CREDITS.md`.
+
 ## License
 
 Released under the [MIT License](LICENSE) — free to use, modify, and
