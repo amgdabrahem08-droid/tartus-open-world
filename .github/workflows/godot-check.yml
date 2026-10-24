@@ -1,0 +1,52 @@
+name: Godot Project Check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Download Godot 4.7
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godot"
+          cd "$RUNNER_TEMP/godot"
+          curl -fL --retry 3 \
+            https://github.com/godotengine/godot/releases/download/4.7-stable/Godot_v4.7-stable_linux.x86_64.zip \
+            -o godot.zip
+          unzip -q godot.zip
+          sudo install Godot_v4.7-stable_linux.x86_64 /usr/local/bin/godot
+          godot --version
+
+      - name: Import project resources
+        run: |
+          set -o pipefail
+          godot --headless --editor --path "$GITHUB_WORKSPACE" --import --quit \
+            2>&1 | tee import.log
+
+      - name: Start main scene headlessly
+        run: |
+          set -o pipefail
+          godot --headless --path "$GITHUB_WORKSPACE" --quit-after 10 \
+            2>&1 | tee startup.log
+
+      - name: Save diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-diagnostic-logs
+          path: |
+            import.log
+            startup.log
+          if-no-files-found: ignore
