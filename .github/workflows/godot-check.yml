@@ -1,4 +1,4 @@
-name: Godot Project Check
+name: Godot Project Check and Android APK
 
 on:
   push:
@@ -50,3 +50,102 @@ jobs:
             import.log
             startup.log
           if-no-files-found: ignore
+
+  build-android:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.1"
+
+      - name: Download Godot 4.7 and Android templates
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godot"
+          cd "$RUNNER_TEMP/godot"
+
+          curl -fL --retry 3 \
+            https://github.com/godotengine/godot/releases/download/4.7-stable/Godot_v4.7-stable_linux.x86_64.zip \
+            -o godot.zip
+          unzip -q godot.zip
+          sudo install Godot_v4.7-stable_linux.x86_64 /usr/local/bin/godot
+
+          curl -fL --retry 3 \
+            https://github.com/godotengine/godot/releases/download/4.7-stable/Godot_v4.7-stable_export_templates.tpz \
+            -o templates.tpz
+
+          mkdir templates
+          unzip -q templates.tpz -d templates
+
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.7.stable"
+          cp -a templates/templates/. \
+            "$HOME/.local/share/godot/export_templates/4.7.stable/"
+
+      - name: Configure Android signing and SDK paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.android" "$HOME/.config/godot"
+
+          keytool -genkeypair \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<SETTINGS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          SETTINGS
+
+      - name: Export Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PATH="$HOME/.android/debug.keystore"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_USER="androiddebugkey"
+          export GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD="android"
+
+          godot --headless --editor --path "$GITHUB_WORKSPACE" --import --quit
+          godot --headless --path "$GITHUB_WORKSPACE" \
+            --export-debug "Android" build/Tartus-Open-World.apk
+
+          test -s build/Tartus-Open-World.apk
+          ls -lh build/Tartus-Open-World.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tartus-Open-World-Android-APK
+          path: build/Tartus-Open-World.apk
+          if-no-files-found: error
+          retention-days: 14
